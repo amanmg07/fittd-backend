@@ -181,7 +181,7 @@ def try_on_image(
     person_image_b64: str,
     garment_image_url: str,
     garment_description: str = "",
-    denoise_steps: int = 40,
+    denoise_steps: int = 20,
     seed: int = 42,
 ) -> str:
     """
