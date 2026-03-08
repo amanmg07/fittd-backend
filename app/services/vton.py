@@ -409,27 +409,48 @@ def generate_novel_views(front_image_b64: str, num_views: int = 12) -> list[dict
     """
     img_bytes = base64.b64decode(front_image_b64)
 
-    # Build data URI for Replicate
-    input_uri = f"data:image/png;base64,{front_image_b64}"
+    # Zero123++ requires a square input image (>=320x320)
+    # Pad the VTON output (768x1024) to square with white borders
+    img = Image.open(io.BytesIO(img_bytes))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    w, h = img.size
+    square_size = max(w, h)
+    square_img = Image.new("RGB", (square_size, square_size), (255, 255, 255))
+    square_img.paste(img, ((square_size - w) // 2, (square_size - h) // 2))
+    # Resize to 512x512 for faster inference
+    square_img = square_img.resize((512, 512), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    square_img.save(buf, format="PNG")
+    square_b64 = base64.b64encode(buf.getvalue()).decode()
+    input_uri = f"data:image/png;base64,{square_b64}"
 
     try:
         output = replicate.run(
-            "jd7h/zero123plus",
+            "jd7h/zero123plusplus",
             input={
                 "image": input_uri,
-                "num_inference_steps": 75,
-                "guidance_scale": 10.0,
             },
         )
 
-        result_url = output if isinstance(output, str) else str(output)
+        # Replicate may return a FileOutput, URL string, or list
+        if hasattr(output, 'read'):
+            result_data = output.read()
+        elif isinstance(output, list):
+            result_url = str(output[0])
+            with httpx.Client(timeout=60.0, follow_redirects=True) as http:
+                resp = http.get(result_url)
+                resp.raise_for_status()
+            result_data = resp.content
+        else:
+            result_url = str(output)
+            with httpx.Client(timeout=60.0, follow_redirects=True) as http:
+                resp = http.get(result_url)
+                resp.raise_for_status()
+            result_data = resp.content
 
-        # Download the result grid
-        with httpx.Client(timeout=60.0, follow_redirects=True) as http:
-            resp = http.get(result_url)
-            resp.raise_for_status()
-
-        result_img = Image.open(io.BytesIO(resp.content))
+        result_img = Image.open(io.BytesIO(result_data))
 
         # Zero123++ outputs a 3x2 grid (3 cols x 2 rows)
         grid_w, grid_h = result_img.size
@@ -446,12 +467,7 @@ def generate_novel_views(front_image_b64: str, num_views: int = 12) -> list[dict
 
         views = []
         # Include the original front as 0°
-        img = Image.open(io.BytesIO(img_bytes))
-        buf = io.BytesIO()
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        img.save(buf, format="PNG")
-        views.append({"angle_deg": 0, "image_b64": base64.b64encode(buf.getvalue()).decode()})
+        views.append({"angle_deg": 0, "image_b64": front_image_b64})
 
         for col, row, angle in angle_map:
             cell = result_img.crop((col * cell_w, row * cell_h, (col + 1) * cell_w, (row + 1) * cell_h))
