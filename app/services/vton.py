@@ -18,33 +18,22 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import replicate
-
-
-# Keep gradio_client for background removal (free HF Space)
-from gradio_client import Client, handle_file
-
-_rembg_client: Client | None = None
-
-
-def get_rembg_client() -> Client:
-    global _rembg_client
-    if _rembg_client is None:
-        _rembg_client = Client("not-lain/background-removal")
-    return _rembg_client
+from rembg import remove as rembg_remove
 
 
 def remove_background(image_path: str) -> str:
     """
-    Remove background using a free HF Space.
+    Remove background locally using rembg (no API calls).
     Returns path to the result image (PNG with transparency).
     """
     try:
-        client = get_rembg_client()
-        result = client.predict(
-            handle_file(image_path),
-            api_name="/predict",
-        )
-        return result
+        with open(image_path, "rb") as f:
+            input_data = f.read()
+        output_data = rembg_remove(input_data)
+        out_path = image_path.rsplit(".", 1)[0] + "_nobg.png"
+        with open(out_path, "wb") as f:
+            f.write(output_data)
+        return out_path
     except Exception:
         return image_path
 
