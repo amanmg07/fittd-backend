@@ -18,24 +18,6 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import replicate
-from rembg import remove as rembg_remove
-
-
-def remove_background(image_path: str) -> str:
-    """
-    Remove background locally using rembg (no API calls).
-    Returns path to the result image (PNG with transparency).
-    """
-    try:
-        with open(image_path, "rb") as f:
-            input_data = f.read()
-        output_data = rembg_remove(input_data)
-        out_path = image_path.rsplit(".", 1)[0] + "_nobg.png"
-        with open(out_path, "wb") as f:
-            f.write(output_data)
-        return out_path
-    except Exception:
-        return image_path
 
 
 def detect_body_bounds(image_cv: np.ndarray) -> dict | None:
@@ -204,27 +186,6 @@ def preprocess_person_image(image_b64: str) -> str:
     if img.mode != "RGB":
         img = img.convert("RGB")
 
-    # Save temp for bg removal
-    tmp_in = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-    img.save(tmp_in.name, "JPEG", quality=90)
-
-    # Remove background
-    bg_removed_path = remove_background(tmp_in.name)
-
-    try:
-        bg_img = Image.open(bg_removed_path)
-        if bg_img.mode == "RGBA":
-            # Paste onto neutral gray background
-            bg = Image.new("RGB", bg_img.size, (220, 220, 220))
-            bg.paste(bg_img, mask=bg_img.split()[3])
-            img = bg
-        else:
-            img = bg_img.convert("RGB")
-    except Exception:
-        pass  # Use original image if bg removal result can't be loaded
-
-    os.unlink(tmp_in.name)
-
     # Body-aware crop to 768x1024
     img = body_aware_crop(img, 768, 1024)
 
@@ -237,9 +198,7 @@ def preprocess_garment_image(image_url: str) -> str:
     """
     Download and preprocess garment image for IDM-VTON:
     1. Download from URL (high quality)
-    2. Remove background via HF Space
-    3. Auto-crop to garment bounding box
-    4. Resize to 768x1024 with white padding, garment centered and large
+    2. Resize to 768x1024 with white padding, garment centered and large
     """
     with httpx.Client(timeout=30.0, follow_redirects=True) as http:
         resp = http.get(image_url)
@@ -254,30 +213,6 @@ def preprocess_garment_image(image_url: str) -> str:
         img = bg
     elif img.mode != "RGB":
         img = img.convert("RGB")
-
-    # Save temp for bg removal
-    tmp_in = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-    img.save(tmp_in.name, "JPEG", quality=95)
-
-    # Remove background
-    bg_removed_path = remove_background(tmp_in.name)
-
-    try:
-        bg_img = Image.open(bg_removed_path)
-        if bg_img.mode == "RGBA":
-            # Auto-crop to garment bounding box (trim transparent edges)
-            bbox = bg_img.split()[3].getbbox()
-            if bbox:
-                bg_img = bg_img.crop(bbox)
-            bg = Image.new("RGB", bg_img.size, (255, 255, 255))
-            bg.paste(bg_img, mask=bg_img.split()[3])
-            img = bg
-        else:
-            img = bg_img.convert("RGB")
-    except Exception:
-        pass
-
-    os.unlink(tmp_in.name)
 
     # Resize to 768x1024 with white padding
     # Make garment fill ~85% of the frame for better detail preservation
