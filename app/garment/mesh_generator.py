@@ -311,21 +311,119 @@ def generate_fit_map(
     return colors
 
 
+def texture_body_with_photo(
+    body_mesh: trimesh.Trimesh,
+    photo_image: Image.Image,
+) -> trimesh.Trimesh:
+    """
+    Project a person photo onto the body mesh as a texture using
+    cylindrical UV mapping. The front of the photo maps to the front
+    of the mesh, mirrored onto the back.
+    """
+    import base64
+
+    verts = body_mesh.vertices
+
+    # Cylindrical UV mapping: angle around Y axis → U, height → V
+    angles = np.arctan2(verts[:, 2], verts[:, 0])
+    u = (angles + np.pi) / (2 * np.pi)
+
+    y_min, y_max = verts[:, 1].min(), verts[:, 1].max()
+    v = 1.0 - (verts[:, 1] - y_min) / (y_max - y_min + 1e-8)  # flip V so head is top
+
+    uv = np.column_stack([u, v])
+
+    # Build the texture: photo on front half, mirrored on back half
+    tex_size = 1024
+    photo_resized = photo_image.resize((tex_size // 2, tex_size), Image.LANCZOS)
+    mirrored = photo_resized.transpose(Image.FLIP_LEFT_RIGHT)
+
+    # Create full cylindrical texture: [mirrored_back | front]
+    # U=0 is the back-center, U=0.5 is the front-center
+    texture = Image.new("RGB", (tex_size, tex_size), (180, 170, 160))
+    # Front half (U = 0.25 to 0.75 maps to center-front)
+    texture.paste(photo_resized, (tex_size // 4, 0))
+    # Back: fill the sides with mirrored version
+    texture.paste(mirrored, (0, 0), )
+    # Paste front on top to ensure it takes priority in the center
+    texture.paste(photo_resized, (tex_size // 4, 0))
+
+    # Blend the seams slightly
+    # Create a smoother version by putting front in the correct UV region
+    full_tex = Image.new("RGB", (tex_size, tex_size), (180, 170, 160))
+
+    # The front of the person should map to ~U=0.5
+    # Place the photo centered at U=0.5 spanning ~60% of the width
+    photo_w = int(tex_size * 0.6)
+    photo_region = photo_image.resize((photo_w, tex_size), Image.LANCZOS)
+    front_x = (tex_size - photo_w) // 2
+    full_tex.paste(photo_region, (front_x, 0))
+
+    # Fill the back (U=0 and U=1 region) with the mirrored version
+    back_region = photo_region.transpose(Image.FLIP_LEFT_RIGHT)
+    # Left side (back)
+    back_w = front_x
+    if back_w > 0:
+        back_crop = back_region.crop((photo_w - back_w, 0, photo_w, tex_size))
+        full_tex.paste(back_crop, (0, 0))
+    # Right side (back, wraps around)
+    right_start = front_x + photo_w
+    right_w = tex_size - right_start
+    if right_w > 0:
+        right_crop = back_region.crop((0, 0, right_w, tex_size))
+        full_tex.paste(right_crop, (right_start, 0))
+
+    # Apply texture to mesh
+    img_bytes = io.BytesIO()
+    full_tex.save(img_bytes, format="PNG")
+    img_bytes.seek(0)
+
+    material = trimesh.visual.material.PBRMaterial(
+        baseColorTexture=Image.open(img_bytes),
+        metallicFactor=0.0,
+        roughnessFactor=0.9,
+    )
+
+    body_mesh.visual = trimesh.visual.TextureVisuals(uv=uv, material=material)
+    return body_mesh
+
+
 def build_tryon_scene(
     body_glb: bytes,
     garment_size_dims: dict,
     garment_color: str = "#333333",
     garment_image_url: str | None = None,
+    tryon_photo_b64: str | None = None,
 ) -> bytes:
     """
-    Build a complete try-on scene: body + draped garment with texture.
-    Returns GLB bytes of the combined scene.
+    Build a complete try-on scene.
+
+    If tryon_photo_b64 is provided (AI try-on result), texture the body
+    mesh directly with the photo for a recognizable 3D avatar.
+    Otherwise, drape a garment mesh with product texture.
+
+    Returns GLB bytes.
     """
+    import base64
+
     body_mesh = trimesh.load(trimesh.util.wrap_as_stream(body_glb), file_type="glb")
     if isinstance(body_mesh, trimesh.Scene):
         body_mesh = trimesh.util.concatenate(body_mesh.dump())
 
-    # Create garment with proper shape
+    if tryon_photo_b64:
+        # Use the AI try-on photo as body texture — the 3D model looks like the user
+        photo_bytes = base64.b64decode(tryon_photo_b64)
+        photo_img = Image.open(io.BytesIO(photo_bytes))
+        if photo_img.mode != "RGB":
+            photo_img = photo_img.convert("RGB")
+
+        textured_body = texture_body_with_photo(body_mesh, photo_img)
+
+        scene = trimesh.Scene()
+        scene.add_geometry(textured_body, node_name="body")
+        return scene.export(file_type="glb")
+
+    # Fallback: original garment draping approach
     garment_template = create_tshirt_mesh(
         chest_cm=garment_size_dims.get("chest_cm", 100),
         length_cm=garment_size_dims.get("length_cm", 72),
@@ -333,15 +431,12 @@ def build_tryon_scene(
         sleeve_cm=garment_size_dims.get("sleeve_cm", 63),
     )
 
-    # Position garment on body (align waist height)
     body_center_y = (body_mesh.vertices[:, 1].min() + body_mesh.vertices[:, 1].max()) / 2
     garment_center_y = (garment_template.vertices[:, 1].min() + garment_template.vertices[:, 1].max()) / 2
     garment_template.vertices[:, 1] += (body_center_y - garment_center_y) * 0.15
 
-    # Drape garment on body
     draped_garment = drape_garment_on_body(garment_template, body_mesh)
 
-    # Apply texture
     product_image = None
     if garment_image_url:
         product_image = download_garment_image(garment_image_url)
@@ -349,7 +444,6 @@ def build_tryon_scene(
     texture = create_garment_texture(product_image, garment_color)
     draped_garment = apply_texture_to_mesh(draped_garment, texture)
 
-    # Build scene
     scene = trimesh.Scene()
     scene.add_geometry(body_mesh, node_name="body")
     scene.add_geometry(draped_garment, node_name="garment")

@@ -61,9 +61,12 @@ def _build_garment_description(garment) -> str:
 @router.post("/", response_model=TryOnResult)
 async def virtual_tryon(request: TryOnRequest):
     """
-    Perform virtual try-on: recommend size, generate 3D scene
-    with garment draped on user's body model.
+    Perform virtual try-on: recommend size, generate 3D scene.
+    Uses the AI try-on photo to texture the body mesh so the 3D model
+    actually looks like the user wearing the garment.
     """
+    from app.services.vton import try_on_image_async
+
     profile = _profiles.get(request.user_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Body profile not found. Scan first.")
@@ -91,7 +94,22 @@ async def virtual_tryon(request: TryOnRequest):
     if not body_mesh_bytes:
         raise HTTPException(status_code=404, detail="Body mesh not found")
 
-    # Pick best garment image for 3D texture
+    # Run AI try-on to get a photo of the user wearing the garment
+    tryon_photo_b64 = None
+    person_photo = request.photo or _photo_store.get(request.user_id)
+    if person_photo and garment.image_urls:
+        try:
+            garment_url = _pick_best_garment_image(garment.image_urls)
+            garment_desc = _build_garment_description(garment)
+            tryon_photo_b64 = await try_on_image_async(
+                person_image_b64=person_photo,
+                garment_image_url=garment_url,
+                garment_description=garment_desc,
+            )
+        except Exception:
+            pass  # Fall back to garment-only texture
+
+    # Pick garment image as fallback texture
     garment_image_url = None
     if garment.image_urls:
         garment_image_url = _pick_best_garment_image(garment.image_urls)
@@ -102,6 +120,7 @@ async def virtual_tryon(request: TryOnRequest):
             garment_size_dims=size_dims,
             garment_color="#333333",
             garment_image_url=garment_image_url,
+            tryon_photo_b64=tryon_photo_b64,
         )
 
         scene_key = f"{request.user_id}_{request.product_id}_{selected_size}"
