@@ -34,6 +34,7 @@ async def create_body_scan(request: BodyScanRequest):
         _profiles[request.user_id] = profile
         _mesh_store[request.user_id] = mesh_bytes
         _photo_store[request.user_id] = request.front_image
+        _side_photo_store[request.user_id] = request.side_image
 
         return profile
 
@@ -94,3 +95,4 @@ async def get_body_mesh(user_id: str):
 
 _mesh_store: dict[str, bytes] = {}
 _photo_store: dict[str, str] = {}  # user_id -> front photo base64
+_side_photo_store: dict[str, str] = {}  # user_id -> side photo base64

@@ -4,7 +4,7 @@ from fastapi.responses import Response
 from app.models.schemas import TryOnRequest, TryOnResult, SizeRecommendation
 from app.services.fit_engine import recommend_size
 from app.garment.mesh_generator import build_tryon_scene
-from app.api.body import _profiles, _mesh_store, _photo_store
+from app.api.body import _profiles, _mesh_store, _photo_store, _side_photo_store
 from app.api.garments import _garment_cache
 
 router = APIRouter()
@@ -178,3 +178,83 @@ async def ai_virtual_tryon(request: TryOnRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI try-on failed: {str(e)}")
+
+
+@router.post("/ai/multi")
+async def ai_multi_angle_tryon(request: TryOnRequest):
+    """
+    Multi-angle AI try-on: generates front, side, and back views.
+    - Front: VTON with front photo
+    - Side: VTON with side photo
+    - Back: horizontally mirrored front result
+    """
+    from app.services.vton import try_on_image_async, mirror_image_b64
+    import asyncio
+
+    front_photo = request.photo or _photo_store.get(request.user_id)
+    if not front_photo:
+        raise HTTPException(
+            status_code=404,
+            detail="No photo found. Please scan your body first.",
+        )
+
+    side_photo = _side_photo_store.get(request.user_id)
+
+    garment = _garment_cache.get(request.product_id)
+    if not garment:
+        raise HTTPException(status_code=404, detail="Garment not found. Scrape it first.")
+
+    if not garment.image_urls:
+        raise HTTPException(status_code=400, detail="No garment image available.")
+
+    profile = _profiles.get(request.user_id)
+    recommendation = None
+    if profile:
+        recommendation = recommend_size(profile.measurements, garment)
+
+    garment_url = _pick_best_garment_image(garment.image_urls)
+    garment_desc = _build_garment_description(garment)
+
+    try:
+        # Run front and side VTON in parallel
+        tasks = [
+            try_on_image_async(front_photo, garment_url, garment_desc),
+        ]
+        if side_photo:
+            tasks.append(try_on_image_async(side_photo, garment_url, garment_desc))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        front_b64 = results[0] if not isinstance(results[0], Exception) else None
+        side_b64 = None
+        if len(results) > 1 and not isinstance(results[1], Exception):
+            side_b64 = results[1]
+
+        # Generate back view by mirroring the front
+        back_b64 = None
+        if front_b64:
+            back_b64 = mirror_image_b64(front_b64)
+
+        if not front_b64:
+            raise HTTPException(status_code=500, detail="Failed to generate front view")
+
+        selected_size = request.size or (
+            recommendation.recommended_size if recommendation else garment.sizes[0].size_label
+        )
+
+        images = [{"angle": "Front", "image_b64": front_b64}]
+        if side_b64:
+            images.append({"angle": "Side", "image_b64": side_b64})
+        if back_b64:
+            images.append({"angle": "Back", "image_b64": back_b64})
+
+        return {
+            "images": images,
+            "selected_size": selected_size,
+            "recommendation": recommendation.model_dump() if recommendation else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Multi-angle try-on failed: {str(e)}")

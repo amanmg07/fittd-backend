@@ -361,6 +361,16 @@ def try_on_image(
         os.unlink(garment_path)
 
 
+def mirror_image_b64(image_b64: str) -> str:
+    """Horizontally mirror an image. Used to approximate a back view from front."""
+    img_bytes = base64.b64decode(image_b64)
+    img = Image.open(io.BytesIO(img_bytes))
+    mirrored = ImageOps.mirror(img)
+    buf = io.BytesIO()
+    mirrored.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
 async def try_on_image_async(
     person_image_b64: str,
     garment_image_url: str,
