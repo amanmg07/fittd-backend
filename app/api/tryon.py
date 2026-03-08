@@ -91,11 +91,17 @@ async def virtual_tryon(request: TryOnRequest):
     if not body_mesh_bytes:
         raise HTTPException(status_code=404, detail="Body mesh not found")
 
+    # Pick best garment image for 3D texture
+    garment_image_url = None
+    if garment.image_urls:
+        garment_image_url = _pick_best_garment_image(garment.image_urls)
+
     try:
         scene_bytes = build_tryon_scene(
             body_glb=body_mesh_bytes,
             garment_size_dims=size_dims,
             garment_color="#333333",
+            garment_image_url=garment_image_url,
         )
 
         scene_key = f"{request.user_id}_{request.product_id}_{selected_size}"

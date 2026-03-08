@@ -1,16 +1,17 @@
 """
 Parametric human body mesh generator.
 
-Creates a human-shaped mesh from body measurements without requiring
-external model files (SMPL-X). Uses anatomical proportions to place
-cross-sectional ellipses along the body and skin them into a mesh.
+Creates a realistic human-shaped mesh from body measurements.
+Uses dense cross-sectional profiles with cubic interpolation
+and subdivision smoothing for a natural appearance.
 """
 
 import numpy as np
 import trimesh
+from scipy.interpolate import CubicSpline
 
 
-def ellipse_ring(center: np.ndarray, rx: float, rz: float, n: int = 24) -> np.ndarray:
+def ellipse_ring(center: np.ndarray, rx: float, rz: float, n: int = 48) -> np.ndarray:
     """Generate a ring of vertices forming an ellipse at a given center."""
     angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
     verts = np.zeros((n, 3))
@@ -25,7 +26,7 @@ def skin_rings(rings: list[np.ndarray], cap_top: bool = True, cap_bottom: bool =
     Connect a sequence of vertex rings into a mesh with quads (as triangles).
     Returns (vertices, faces).
     """
-    n = len(rings[0])  # verts per ring
+    n = len(rings[0])
     all_verts = np.vstack(rings)
     faces = []
 
@@ -39,7 +40,6 @@ def skin_rings(rings: list[np.ndarray], cap_top: bool = True, cap_bottom: bool =
             faces.append([v0, v2, v1])
             faces.append([v1, v2, v3])
 
-    # Cap top
     if cap_top:
         top_center_idx = len(all_verts)
         top_center = rings[0].mean(axis=0)
@@ -48,7 +48,6 @@ def skin_rings(rings: list[np.ndarray], cap_top: bool = True, cap_bottom: bool =
             s_next = (s + 1) % n
             faces.append([top_center_idx, s, s_next])
 
-    # Cap bottom
     if cap_bottom:
         bottom_center_idx = len(all_verts)
         bottom_center = rings[-1].mean(axis=0)
@@ -59,6 +58,30 @@ def skin_rings(rings: list[np.ndarray], cap_top: bool = True, cap_bottom: bool =
             faces.append([bottom_center_idx, last_ring_start + s_next, last_ring_start + s])
 
     return all_verts, np.array(faces)
+
+
+def interpolate_profile(key_points: list[tuple], num_rings: int = 30) -> list[tuple]:
+    """
+    Smoothly interpolate between key body profile points using cubic splines.
+    key_points: list of (y, rx, rz) tuples
+    Returns densely sampled (y, rx, rz) tuples.
+    """
+    key_points = sorted(key_points, key=lambda p: p[0])
+    ys = [p[0] for p in key_points]
+    rxs = [p[1] for p in key_points]
+    rzs = [p[2] for p in key_points]
+
+    cs_rx = CubicSpline(ys, rxs, bc_type='clamped')
+    cs_rz = CubicSpline(ys, rzs, bc_type='clamped')
+
+    y_dense = np.linspace(ys[0], ys[-1], num_rings)
+    result = []
+    for y in y_dense:
+        rx = max(0.001, float(cs_rx(y)))
+        rz = max(0.001, float(cs_rz(y)))
+        result.append((float(y), rx, rz))
+
+    return result
 
 
 def build_body_mesh(
@@ -74,164 +97,190 @@ def build_body_mesh(
     gender: str = "male",
 ) -> trimesh.Trimesh:
     """
-    Build a human-shaped mesh from body measurements.
+    Build a realistic human-shaped mesh from body measurements.
     All inputs in cm, output mesh in meters.
-    """
-    # Convert to meters
-    H = height_cm / 100.0
-    seg = 24  # vertices per ring
 
-    # Key heights (y coordinates, 0 = feet, H = top of head)
+    Uses 48 vertices per ring, cubic spline interpolation between
+    anatomical landmarks, and gender-specific proportions.
+    """
+    H = height_cm / 100.0
+    seg = 48  # vertices per ring — double the old 24 for smoothness
+
+    # ── Key heights (y coordinates, 0 = feet, H = top of head) ──
+    foot_y = 0.0
     ankle_y = H * 0.05
+    mid_calf_y = H * 0.16
     knee_y = H * 0.27
+    mid_thigh_y = H * 0.36
     crotch_y = H * 0.45
     hip_y = H * 0.50
     waist_y = H * 0.58
+    lower_chest_y = H * 0.65
     chest_y = H * 0.70
+    upper_chest_y = H * 0.74
     shoulder_y = H * 0.78
     neck_base_y = H * 0.82
+    neck_mid_y = H * 0.85
     neck_top_y = H * 0.87
-    head_y = H * 0.94
-    top_y = H
+    chin_y = H * 0.88
+    head_center_y = H * 0.92
+    head_top_y = H * 0.97
 
-    # Radii from circumferences (C = pi*(a+b) approximation for ellipses)
-    # Front-to-side ratio differs by region
-    chest_rx = (chest_cm / 100) / (2 * np.pi) * 1.15  # wider front
-    chest_rz = (chest_cm / 100) / (2 * np.pi) * 0.85  # shallower side
-    waist_rx = (waist_cm / 100) / (2 * np.pi) * 1.1
-    waist_rz = (waist_cm / 100) / (2 * np.pi) * 0.9
-    hip_rx = (hips_cm / 100) / (2 * np.pi) * 1.1
-    hip_rz = (hips_cm / 100) / (2 * np.pi) * 0.9
+    # ── Radii from circumferences ──
+    # Use elliptical cross-sections: front wider, side shallower
+    # Gender-specific front-to-side ratios
+    if gender == "female":
+        chest_front_ratio, chest_side_ratio = 1.10, 0.90
+        waist_front_ratio, waist_side_ratio = 1.08, 0.92
+        hip_front_ratio, hip_side_ratio = 1.15, 0.85
+    else:
+        chest_front_ratio, chest_side_ratio = 1.15, 0.85
+        waist_front_ratio, waist_side_ratio = 1.10, 0.90
+        hip_front_ratio, hip_side_ratio = 1.10, 0.90
+
+    chest_rx = (chest_cm / 100) / (2 * np.pi) * chest_front_ratio
+    chest_rz = (chest_cm / 100) / (2 * np.pi) * chest_side_ratio
+    waist_rx = (waist_cm / 100) / (2 * np.pi) * waist_front_ratio
+    waist_rz = (waist_cm / 100) / (2 * np.pi) * waist_side_ratio
+    hip_rx = (hips_cm / 100) / (2 * np.pi) * hip_front_ratio
+    hip_rz = (hips_cm / 100) / (2 * np.pi) * hip_side_ratio
     shoulder_rx = (shoulder_width_cm / 100) / 2
-    shoulder_rz = chest_rz * 0.85
+    shoulder_rz = chest_rz * 0.82
     neck_r = (neck_cm / 100) / (2 * np.pi)
 
-    # Head radius
-    head_r = H * 0.045
+    # Head dimensions
+    head_rx = H * 0.046
+    head_rz = H * 0.042
 
-    # Leg/arm thickness based on build
+    # Build/BMI factor for limb thickness
     bmi = weight_kg / (H * H)
     build_factor = np.clip(bmi / 22.0, 0.8, 1.4)
 
-    thigh_rx = hip_rx * 0.42 * build_factor
-    thigh_rz = hip_rz * 0.42 * build_factor
-    knee_rx = thigh_rx * 0.75
-    knee_rz = thigh_rz * 0.75
-    calf_rx = knee_rx * 0.85
-    calf_rz = knee_rz * 0.85
-    ankle_rx = knee_rx * 0.55
-    ankle_rz = knee_rz * 0.55
+    # Limb radii
+    thigh_rx = hip_rx * 0.44 * build_factor
+    thigh_rz = hip_rz * 0.44 * build_factor
+    knee_rx = thigh_rx * 0.72
+    knee_rz = thigh_rz * 0.72
+    calf_rx = knee_rx * 0.88
+    calf_rz = knee_rz * 0.88
+    ankle_rx = knee_rx * 0.52
+    ankle_rz = knee_rz * 0.52
 
     upper_arm_r = chest_rx * 0.22 * build_factor
-    forearm_r = upper_arm_r * 0.75
-    wrist_r = upper_arm_r * 0.5
+    forearm_r = upper_arm_r * 0.72
+    wrist_r = upper_arm_r * 0.48
+    hand_r = wrist_r * 0.65
 
     meshes = []
 
-    # ── TORSO ──
-    torso_rings = []
-    # Build torso profile from crotch to neck
-    torso_profile = [
-        (crotch_y, hip_rx * 0.85, hip_rz * 0.85),
-        (hip_y,    hip_rx,        hip_rz),
-        (hip_y + (waist_y - hip_y) * 0.5, (hip_rx + waist_rx) / 2, (hip_rz + waist_rz) / 2),
-        (waist_y,  waist_rx,      waist_rz),
-        (waist_y + (chest_y - waist_y) * 0.5, (waist_rx + chest_rx) / 2, (waist_rz + chest_rz) / 2),
-        (chest_y,  chest_rx,      chest_rz),
-        (chest_y + (shoulder_y - chest_y) * 0.5, (chest_rx + shoulder_rx) / 2, (chest_rz + shoulder_rz) / 2),
-        (shoulder_y, shoulder_rx,  shoulder_rz),
-        (neck_base_y, neck_r * 1.3, neck_r * 1.2),
+    # ── TORSO (spline-interpolated) ──
+    torso_key_points = [
+        (crotch_y,      hip_rx * 0.82,  hip_rz * 0.82),
+        (hip_y,         hip_rx,         hip_rz),
+        (waist_y,       waist_rx,       waist_rz),
+        (lower_chest_y, (waist_rx + chest_rx) / 2, (waist_rz + chest_rz) / 2),
+        (chest_y,       chest_rx,       chest_rz),
+        (upper_chest_y, (chest_rx + shoulder_rx) * 0.52, (chest_rz + shoulder_rz) * 0.52),
+        (shoulder_y,    shoulder_rx,    shoulder_rz),
+        (neck_base_y,   neck_r * 1.25,  neck_r * 1.15),
     ]
 
+    torso_profile = interpolate_profile(torso_key_points, num_rings=28)
+    torso_rings = []
     for y, rx, rz in torso_profile:
-        center = np.array([0, y, 0])
-        torso_rings.append(ellipse_ring(center, rx, rz, seg))
+        torso_rings.append(ellipse_ring(np.array([0, y, 0]), rx, rz, seg))
 
     tv, tf = skin_rings(torso_rings, cap_top=False, cap_bottom=False)
     meshes.append(trimesh.Trimesh(vertices=tv, faces=tf, process=False))
 
-    # ── NECK ──
-    neck_rings = [
-        ellipse_ring(np.array([0, neck_base_y, 0]), neck_r * 1.2, neck_r * 1.1, seg),
-        ellipse_ring(np.array([0, (neck_base_y + neck_top_y) / 2, 0]), neck_r, neck_r, seg),
-        ellipse_ring(np.array([0, neck_top_y, 0]), neck_r * 0.95, neck_r * 0.95, seg),
+    # ── NECK (spline-interpolated) ──
+    neck_key = [
+        (neck_base_y, neck_r * 1.20, neck_r * 1.10),
+        (neck_mid_y,  neck_r * 0.98, neck_r * 0.95),
+        (neck_top_y,  neck_r * 0.92, neck_r * 0.90),
+        (chin_y,      neck_r * 0.85, neck_r * 0.82),
     ]
+    neck_profile = interpolate_profile(neck_key, num_rings=10)
+    neck_rings = []
+    for y, rx, rz in neck_profile:
+        neck_rings.append(ellipse_ring(np.array([0, y, 0]), rx, rz, seg))
+
     nv, nf = skin_rings(neck_rings, cap_top=False, cap_bottom=False)
     meshes.append(trimesh.Trimesh(vertices=nv, faces=nf, process=False))
 
-    # ── HEAD ──
-    head_mesh = trimesh.creation.icosphere(subdivisions=2, radius=head_r)
-    head_mesh.apply_translation([0, head_y, 0])
-    # Slightly elongate vertically
-    head_mesh.vertices[:, 1] *= 1.2
+    # ── HEAD (higher-res icosphere, elongated) ──
+    head_mesh = trimesh.creation.icosphere(subdivisions=3, radius=head_rx)
+    head_mesh.apply_translation([0, head_center_y, 0])
+    # Elongate vertically for realistic head shape
+    head_mesh.vertices[:, 1] *= 1.25
+    # Slightly flatten front-to-back
+    head_mesh.vertices[:, 2] *= (head_rz / head_rx)
     meshes.append(head_mesh)
 
-    # ── LEGS ──
-    leg_sep = hip_rx * 0.45  # distance between leg centers
+    # ── LEGS (spline-interpolated) ──
+    leg_sep = hip_rx * 0.44
 
     for side in [-1, 1]:
         cx = side * leg_sep
-        leg_rings = [
-            ellipse_ring(np.array([cx, crotch_y, 0]), thigh_rx, thigh_rz, seg),
-            ellipse_ring(np.array([cx, crotch_y - (crotch_y - knee_y) * 0.33, 0]),
-                        thigh_rx * 0.92, thigh_rz * 0.92, seg),
-            ellipse_ring(np.array([cx, crotch_y - (crotch_y - knee_y) * 0.66, 0]),
-                        (thigh_rx + knee_rx) / 2, (thigh_rz + knee_rz) / 2, seg),
-            ellipse_ring(np.array([cx, knee_y, 0]), knee_rx, knee_rz, seg),
-            ellipse_ring(np.array([cx, knee_y - (knee_y - ankle_y) * 0.33, 0]),
-                        calf_rx, calf_rz, seg),
-            ellipse_ring(np.array([cx, knee_y - (knee_y - ankle_y) * 0.66, 0]),
-                        (calf_rx + ankle_rx) / 2, (calf_rz + ankle_rz) / 2, seg),
-            ellipse_ring(np.array([cx, ankle_y, 0]), ankle_rx, ankle_rz, seg),
-            ellipse_ring(np.array([cx, 0, 0]), ankle_rx * 0.9, ankle_rz * 1.3, seg),  # foot
+        leg_key = [
+            (crotch_y,    thigh_rx,            thigh_rz),
+            (mid_thigh_y, thigh_rx * 0.88,     thigh_rz * 0.88),
+            (knee_y,      knee_rx,             knee_rz),
+            (mid_calf_y,  calf_rx,             calf_rz),
+            (ankle_y,     ankle_rx,            ankle_rz),
+            (foot_y,      ankle_rx * 0.85,     ankle_rz * 1.35),
         ]
+        leg_profile = interpolate_profile(leg_key, num_rings=18)
+        leg_rings = []
+        for y, rx, rz in leg_profile:
+            leg_rings.append(ellipse_ring(np.array([cx, y, 0]), rx, rz, seg))
+
         lv, lf = skin_rings(leg_rings, cap_top=False, cap_bottom=True)
         meshes.append(trimesh.Trimesh(vertices=lv, faces=lf, process=False))
 
-    # ── ARMS ──
+    # ── ARMS (A-pose: angled ~30° outward for garment visibility) ──
     arm_len_m = arm_length_cm / 100.0
+    arm_angle = np.radians(30)  # A-pose angle from vertical
 
-    for side in [-1, 1]:
-        sx = side * (shoulder_rx + 0.01)
+    for side_sign in [-1, 1]:
+        sx = side_sign * (shoulder_rx + 0.005)
         sy = shoulder_y
 
-        # Arm hangs down with slight angle outward
-        arm_dir_x = side * 0.15
-        arm_dir_y = -1.0
-        arm_len_norm = np.sqrt(arm_dir_x**2 + arm_dir_y**2)
-        arm_dir_x /= arm_len_norm
-        arm_dir_y /= arm_len_norm
+        # Arm direction: angled outward and slightly down
+        arm_dir_x = side_sign * np.sin(arm_angle)
+        arm_dir_y = -np.cos(arm_angle)
 
-        elbow_t = 0.47  # elbow at ~47% of arm length
-        wrist_t = 0.95
-
-        points = []
-        for t in [0, 0.2, elbow_t, 0.65, wrist_t, 1.0]:
-            px = sx + arm_dir_x * arm_len_m * t
-            py = sy + arm_dir_y * arm_len_m * t
-            points.append((px, py))
-
-        radii = [
-            upper_arm_r * 1.1,   # shoulder joint
-            upper_arm_r,          # upper arm
-            upper_arm_r * 0.85,   # elbow
-            forearm_r,            # forearm
-            wrist_r,              # wrist
-            wrist_r * 0.7,        # hand
+        # Key points along arm with t = fraction of arm length
+        arm_key_t = [0.0, 0.15, 0.35, 0.47, 0.60, 0.80, 0.95, 1.0]
+        arm_radii = [
+            upper_arm_r * 1.12,  # shoulder joint
+            upper_arm_r * 1.02,  # deltoid
+            upper_arm_r * 0.92,  # mid-upper-arm
+            upper_arm_r * 0.82,  # elbow
+            forearm_r * 1.05,    # below elbow
+            forearm_r * 0.88,    # mid-forearm
+            wrist_r,             # wrist
+            hand_r,              # hand
         ]
 
         arm_rings = []
-        for (px, py), r in zip(points, radii):
+        for t, r in zip(arm_key_t, arm_radii):
+            px = sx + arm_dir_x * arm_len_m * t
+            py = sy + arm_dir_y * arm_len_m * t
             arm_rings.append(ellipse_ring(np.array([px, py, 0]), r, r, seg))
 
         av, af = skin_rings(arm_rings, cap_top=False, cap_bottom=True)
         meshes.append(trimesh.Trimesh(vertices=av, faces=af, process=False))
 
-    # Combine all parts
+    # ── Combine and smooth ──
     combined = trimesh.util.concatenate(meshes)
     combined.fix_normals()
 
-    # Apply a skin-like color
+    # Apply Laplacian smoothing for a more natural surface
+    trimesh.smoothing.filter_laplacian(combined, iterations=2, lamb=0.5)
+    combined.fix_normals()
+
+    # Skin-like color
     if gender == "male":
         combined.visual.face_colors = [210, 180, 150, 255]
     else:
