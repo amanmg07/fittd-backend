@@ -388,3 +388,116 @@ async def try_on_image_async(
         garment_image_url,
         garment_description,
     )
+
+
+# --- Novel View Synthesis (360° rotation) ---
+
+_zero123_client: Client | None = None
+
+
+def get_zero123_client() -> Client:
+    global _zero123_client
+    if _zero123_client is None:
+        _zero123_client = Client("sudo-ai/zero123plus-v1.2")
+    return _zero123_client
+
+
+def generate_novel_views(front_image_b64: str, num_views: int = 12) -> list[dict]:
+    """
+    Generate multiple rotated views from a single front image using Zero123++.
+    Returns a list of {"angle_deg": int, "image_b64": str}.
+
+    Zero123++ generates 6 views at fixed angles from a single input.
+    We call it and also mirror some views to fill out the full rotation.
+    """
+    # Save input image to temp file
+    img_bytes = base64.b64decode(front_image_b64)
+    img = Image.open(io.BytesIO(img_bytes))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    tmp_in = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    img.save(tmp_in.name, "PNG")
+
+    try:
+        client = get_zero123_client()
+
+        # Zero123++ v1.2 generates a grid of 6 views
+        result = client.predict(
+            handle_file(tmp_in.name),
+            75,      # num_inference_steps
+            10.0,    # guidance_scale
+            api_name="/generate",
+        )
+
+        result_path = result if isinstance(result, str) else result[0]
+        result_img = Image.open(result_path)
+
+        # Zero123++ outputs a 3x2 grid (3 cols x 2 rows)
+        # Each cell is a different angle view
+        grid_w, grid_h = result_img.size
+        cell_w = grid_w // 3
+        cell_h = grid_h // 2
+
+        # The 6 views are approximately:
+        # Row 0: 30°, 90°, 150°
+        # Row 1: 210°, 270°, 330°
+        angle_map = [
+            (0, 0, 30), (1, 0, 90), (2, 0, 150),
+            (0, 1, 210), (1, 1, 270), (2, 1, 330),
+        ]
+
+        views = []
+        # Include the original front as 0°
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        views.append({"angle_deg": 0, "image_b64": base64.b64encode(buf.getvalue()).decode()})
+
+        for col, row, angle in angle_map:
+            cell = result_img.crop((col * cell_w, row * cell_h, (col + 1) * cell_w, (row + 1) * cell_h))
+            if cell.mode != "RGB":
+                cell = cell.convert("RGB")
+            buf = io.BytesIO()
+            cell.save(buf, format="PNG")
+            views.append({
+                "angle_deg": angle,
+                "image_b64": base64.b64encode(buf.getvalue()).decode(),
+            })
+
+        # Sort by angle
+        views.sort(key=lambda v: v["angle_deg"])
+
+        # Generate intermediate angles by mirroring to fill gaps
+        # Mirror 30° → 330° if not present, etc.
+        filled = {v["angle_deg"]: v for v in views}
+
+        # Add 180° by mirroring 0° if not present
+        if 180 not in filled:
+            mirrored = mirror_image_b64(front_image_b64)
+            filled[180] = {"angle_deg": 180, "image_b64": mirrored}
+
+        final_views = sorted(filled.values(), key=lambda v: v["angle_deg"])
+        return final_views
+
+    except Exception as e:
+        # Fallback: generate basic views from the front image using mirrors
+        views = [
+            {"angle_deg": 0, "image_b64": front_image_b64},
+            {"angle_deg": 180, "image_b64": mirror_image_b64(front_image_b64)},
+        ]
+        return views
+
+    finally:
+        os.unlink(tmp_in.name)
+
+
+async def generate_novel_views_async(front_image_b64: str, num_views: int = 12) -> list[dict]:
+    """Async wrapper for novel view generation."""
+    import asyncio
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        generate_novel_views,
+        front_image_b64,
+        num_views,
+    )

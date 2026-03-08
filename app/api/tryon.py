@@ -258,3 +258,56 @@ async def ai_multi_angle_tryon(request: TryOnRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Multi-angle try-on failed: {str(e)}")
+
+
+@router.post("/ai/360")
+async def ai_360_tryon(request: TryOnRequest):
+    """
+    360° AI try-on: generates a front VTON image, then uses novel view
+    synthesis (Zero123++) to create rotated views for a drag-to-rotate experience.
+    """
+    from app.services.vton import try_on_image_async, generate_novel_views_async
+
+    front_photo = request.photo or _photo_store.get(request.user_id)
+    if not front_photo:
+        raise HTTPException(
+            status_code=404,
+            detail="No photo found. Please scan your body first.",
+        )
+
+    garment = _garment_cache.get(request.product_id)
+    if not garment:
+        raise HTTPException(status_code=404, detail="Garment not found. Scrape it first.")
+
+    if not garment.image_urls:
+        raise HTTPException(status_code=400, detail="No garment image available.")
+
+    profile = _profiles.get(request.user_id)
+    recommendation = None
+    if profile:
+        recommendation = recommend_size(profile.measurements, garment)
+
+    garment_url = _pick_best_garment_image(garment.image_urls)
+    garment_desc = _build_garment_description(garment)
+
+    try:
+        # Step 1: Generate front VTON image
+        front_b64 = await try_on_image_async(front_photo, garment_url, garment_desc)
+
+        # Step 2: Generate 360° views from the front result
+        views = await generate_novel_views_async(front_b64)
+
+        selected_size = request.size or (
+            recommendation.recommended_size if recommendation else garment.sizes[0].size_label
+        )
+
+        return {
+            "views": views,
+            "selected_size": selected_size,
+            "recommendation": recommendation.model_dump() if recommendation else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"360° try-on failed: {str(e)}")
