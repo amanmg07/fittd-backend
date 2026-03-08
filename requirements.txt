@@ -17,6 +17,7 @@ scipy==1.14.1
 smplx==0.1.28
 torch==2.4.1
 opencv-python-headless==4.10.0.84
+mediapipe==0.10.18
 boto3==1.35.19
 python-dotenv==1.0.1
 gradio_client==1.4.0

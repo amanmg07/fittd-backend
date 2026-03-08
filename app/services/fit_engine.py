@@ -6,7 +6,7 @@ Accounts for:
 - Garment measurements vs body measurements (ease/allowance)
 - Fabric stretch properties
 - Fit type (slim vs oversized expects different ease)
-- Per-measurement scoring
+- Per-measurement scoring (chest, waist, hips, shoulders, length, sleeves)
 """
 
 from app.models.schemas import (
@@ -20,10 +20,10 @@ from app.models.schemas import (
 
 # Expected ease (garment measurement - body measurement) by fit type, in cm
 EASE_TARGETS: dict[FitType, dict[str, float]] = {
-    FitType.slim: {"chest": 4.0, "waist": 2.0, "shoulder": 0.5},
-    FitType.regular: {"chest": 10.0, "waist": 8.0, "shoulder": 2.0},
-    FitType.relaxed: {"chest": 16.0, "waist": 14.0, "shoulder": 4.0},
-    FitType.oversized: {"chest": 22.0, "waist": 20.0, "shoulder": 6.0},
+    FitType.slim: {"chest": 4.0, "waist": 2.0, "hips": 2.0, "shoulder": 0.5},
+    FitType.regular: {"chest": 10.0, "waist": 8.0, "hips": 6.0, "shoulder": 2.0},
+    FitType.relaxed: {"chest": 16.0, "waist": 14.0, "hips": 10.0, "shoulder": 4.0},
+    FitType.oversized: {"chest": 22.0, "waist": 20.0, "hips": 14.0, "shoulder": 6.0},
 }
 
 # How much each fabric type stretches (multiplier on garment measurement)
@@ -66,7 +66,7 @@ def score_size(
     notes = []
     penalties = []
 
-    # Effective garment measurements (with stretch)
+    # --- Chest ---
     effective_chest = garment_size.chest_cm * (1 + stretch)
     chest_ease = effective_chest - body.chest
     target_chest_ease = targets["chest"]
@@ -74,7 +74,7 @@ def score_size(
 
     if chest_ease < 0:
         notes.append(f"Chest will be very tight ({abs(chest_ease):.0f}cm too small)")
-        penalties.append(chest_diff * 3)  # Heavy penalty for too small
+        penalties.append(chest_diff * 3)
     elif chest_diff < 3:
         notes.append("Chest fit is ideal")
         penalties.append(0)
@@ -85,7 +85,27 @@ def score_size(
         notes.append("Chest fit is good")
         penalties.append(chest_diff)
 
-    # Shoulder fit
+    # --- Waist ---
+    if garment_size.waist_cm and body.waist:
+        effective_waist = garment_size.waist_cm * (1 + stretch)
+        waist_ease = effective_waist - body.waist
+        target_waist_ease = targets["waist"]
+        waist_diff = abs(waist_ease - target_waist_ease)
+
+        if waist_ease < -2:
+            notes.append(f"Waist will be very tight ({abs(waist_ease):.0f}cm too small)")
+            penalties.append(waist_diff * 2.5)
+        elif waist_diff < 3:
+            notes.append("Waist fit is ideal")
+            penalties.append(0)
+        elif waist_ease > target_waist_ease + 8:
+            notes.append(f"Waist will be baggy ({waist_ease - target_waist_ease:.0f}cm extra)")
+            penalties.append(waist_diff * 1.2)
+        else:
+            notes.append("Waist fit is good")
+            penalties.append(waist_diff * 0.8)
+
+    # --- Shoulder fit ---
     if garment_size.shoulder_cm and body.shoulder_width:
         shoulder_ease = garment_size.shoulder_cm - body.shoulder_width
         target_shoulder = targets["shoulder"]
@@ -100,7 +120,7 @@ def score_size(
         else:
             penalties.append(shoulder_diff)
 
-    # Length fit (compared to torso)
+    # --- Length fit (compared to torso) ---
     if garment_size.length_cm and body.torso_length:
         length_ratio = garment_size.length_cm / body.torso_length
         if length_ratio < 1.15:
@@ -112,7 +132,7 @@ def score_size(
         else:
             notes.append("Length is ideal")
 
-    # Sleeve length
+    # --- Sleeve length ---
     if garment_size.sleeve_cm and body.arm_length:
         sleeve_diff = garment_size.sleeve_cm - body.arm_length * 0.55
         if sleeve_diff < -2:

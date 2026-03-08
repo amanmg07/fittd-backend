@@ -3,6 +3,9 @@ AI Virtual Try-On using IDM-VTON via Hugging Face Spaces.
 
 Sends a person photo + garment image to the model and gets back
 a realistic composite image of the person wearing the garment.
+
+Uses MediaPipe Pose for body-aware cropping to ensure the person
+is properly framed for the VTON model.
 """
 
 import base64
@@ -11,6 +14,9 @@ import os
 from PIL import Image, ImageOps
 import io
 import httpx
+import cv2
+import numpy as np
+import mediapipe as mp
 from gradio_client import Client, handle_file
 
 
@@ -45,8 +51,156 @@ def remove_background(image_path: str) -> str:
         )
         return result
     except Exception:
-        # If bg removal fails, return original
         return image_path
+
+
+def detect_body_bounds(image_cv: np.ndarray) -> dict | None:
+    """
+    Use MediaPipe Pose to detect body landmarks and return bounding info.
+    Returns dict with top_y, bottom_y, center_x, shoulder_width or None.
+    """
+    mp_pose = mp.solutions.pose
+    with mp_pose.Pose(
+        static_image_mode=True,
+        model_complexity=1,
+        min_detection_confidence=0.5,
+    ) as pose:
+        image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
+        results = pose.process(image_rgb)
+
+        if results.pose_landmarks is None:
+            return None
+
+        landmarks = results.pose_landmarks.landmark
+        h, w = image_cv.shape[:2]
+
+        # Collect all visible landmark positions
+        visible_xs = []
+        visible_ys = []
+        for lm in landmarks:
+            if lm.visibility >= 0.5:
+                visible_xs.append(lm.x * w)
+                visible_ys.append(lm.y * h)
+
+        if len(visible_xs) < 5:
+            return None
+
+        # Key landmarks for framing
+        nose = landmarks[0]
+        left_shoulder = landmarks[11]
+        right_shoulder = landmarks[12]
+        left_ankle = landmarks[27]
+        right_ankle = landmarks[28]
+        left_hip = landmarks[23]
+        right_hip = landmarks[24]
+
+        # Center X from mid-shoulder
+        center_x = (left_shoulder.x + right_shoulder.x) / 2 * w
+
+        # Top: above the head (estimate from nose)
+        head_top_y = nose.y * h
+        if landmarks[7].visibility >= 0.5:  # left ear
+            ear_to_nose = abs(nose.y - landmarks[7].y) * h
+            head_top_y = nose.y * h - ear_to_nose * 1.5
+        else:
+            head_top_y = nose.y * h - (h * 0.04)
+
+        # Bottom: ankles or lowest visible point
+        bottom_y = max(visible_ys)
+        if left_ankle.visibility >= 0.5 and right_ankle.visibility >= 0.5:
+            bottom_y = max(left_ankle.y, right_ankle.y) * h
+
+        # Shoulder width in pixels
+        shoulder_w = abs(left_shoulder.x - right_shoulder.x) * w
+
+        # Hip width in pixels
+        hip_w = abs(left_hip.x - right_hip.x) * w
+
+        return {
+            "top_y": head_top_y,
+            "bottom_y": bottom_y,
+            "center_x": center_x,
+            "shoulder_width": shoulder_w,
+            "hip_width": hip_w,
+            "body_width": max(shoulder_w, hip_w),
+        }
+
+
+def body_aware_crop(img: Image.Image, target_w: int = 768, target_h: int = 1024) -> Image.Image:
+    """
+    Crop and resize person image using pose detection for proper framing.
+    Ensures the person is centered and fully visible in the output.
+    """
+    img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    bounds = detect_body_bounds(img_cv)
+
+    w, h = img.size
+
+    if bounds is None:
+        # Fallback: basic center crop
+        target_aspect = target_w / target_h
+        aspect = w / h
+        if aspect > target_aspect:
+            new_w = int(h * target_aspect)
+            left = (w - new_w) // 2
+            img = img.crop((left, 0, left + new_w, h))
+        else:
+            new_h = int(w / target_aspect)
+            img = img.crop((0, 0, w, min(new_h, h)))
+        return img.resize((target_w, target_h), Image.LANCZOS)
+
+    # Calculate crop region centered on the body
+    body_height = bounds["bottom_y"] - bounds["top_y"]
+    body_width = bounds["body_width"]
+    center_x = bounds["center_x"]
+
+    # Add padding: 15% above head, 5% below feet, 40% on each side of body
+    pad_top = body_height * 0.15
+    pad_bottom = body_height * 0.05
+    pad_side = body_width * 0.40
+
+    crop_top = bounds["top_y"] - pad_top
+    crop_bottom = bounds["bottom_y"] + pad_bottom
+    crop_height = crop_bottom - crop_top
+
+    # Width from target aspect ratio
+    target_aspect = target_w / target_h
+    crop_width = crop_height * target_aspect
+
+    # Ensure crop is wide enough to include the body + padding
+    min_crop_width = body_width + 2 * pad_side
+    if crop_width < min_crop_width:
+        crop_width = min_crop_width
+        crop_height = crop_width / target_aspect
+        # Re-center vertically
+        body_center_y = (bounds["top_y"] + bounds["bottom_y"]) / 2
+        crop_top = body_center_y - crop_height * 0.45  # slightly above center
+        crop_bottom = crop_top + crop_height
+
+    crop_left = center_x - crop_width / 2
+    crop_right = center_x + crop_width / 2
+
+    # Clamp to image bounds
+    if crop_left < 0:
+        crop_right -= crop_left
+        crop_left = 0
+    if crop_right > w:
+        crop_left -= (crop_right - w)
+        crop_right = w
+    if crop_top < 0:
+        crop_bottom -= crop_top
+        crop_top = 0
+    if crop_bottom > h:
+        crop_top -= (crop_bottom - h)
+        crop_bottom = h
+
+    crop_left = max(0, crop_left)
+    crop_top = max(0, crop_top)
+    crop_right = min(w, crop_right)
+    crop_bottom = min(h, crop_bottom)
+
+    img = img.crop((int(crop_left), int(crop_top), int(crop_right), int(crop_bottom)))
+    return img.resize((target_w, target_h), Image.LANCZOS)
 
 
 def preprocess_person_image(image_b64: str) -> str:
@@ -55,7 +209,7 @@ def preprocess_person_image(image_b64: str) -> str:
     1. Apply EXIF rotation
     2. Remove background via HF Space
     3. Paste onto neutral gray background
-    4. Resize to 768x1024 portrait
+    4. Body-aware crop and resize to 768x1024 portrait
     """
     img_bytes = base64.b64decode(image_b64)
     img = Image.open(io.BytesIO(img_bytes))
@@ -87,22 +241,8 @@ def preprocess_person_image(image_b64: str) -> str:
 
     os.unlink(tmp_in.name)
 
-    # Resize to 768x1024 portrait
-    target_w, target_h = 768, 1024
-
-    w, h = img.size
-    aspect = w / h
-    target_aspect = target_w / target_h
-
-    if aspect > target_aspect:
-        new_w = int(h * target_aspect)
-        left = (w - new_w) // 2
-        img = img.crop((left, 0, left + new_w, h))
-    else:
-        new_h = int(w / target_aspect)
-        img = img.crop((0, 0, w, min(new_h, h)))
-
-    img = img.resize((target_w, target_h), Image.LANCZOS)
+    # Body-aware crop to 768x1024
+    img = body_aware_crop(img, 768, 1024)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     img.save(tmp.name, "JPEG", quality=92)

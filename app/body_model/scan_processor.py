@@ -3,9 +3,9 @@ Body scan processor: takes front + side photos and produces
 a SMPL-X body model with measurements.
 
 Pipeline:
-1. Extract body silhouette using GrabCut + refinement
-2. Detect body landmarks using contour analysis
-3. Estimate measurements from calibrated pixel ratios
+1. Detect body landmarks using MediaPipe Pose (33 keypoints)
+2. Calculate measurements from landmark positions + side silhouette depth
+3. Blend with statistical estimates for robustness
 4. Generate SMPL-X mesh with derived shape parameters
 """
 
@@ -13,9 +13,31 @@ import base64
 import io
 import numpy as np
 import cv2
+import mediapipe as mp
 
 from app.models.schemas import BodyMeasurements, Gender
 
+
+# MediaPipe Pose landmark indices
+# https://developers.google.com/mediapipe/solutions/vision/pose_landmarker
+LM_NOSE = 0
+LM_LEFT_SHOULDER = 11
+LM_RIGHT_SHOULDER = 12
+LM_LEFT_ELBOW = 13
+LM_RIGHT_ELBOW = 14
+LM_LEFT_WRIST = 15
+LM_RIGHT_WRIST = 16
+LM_LEFT_HIP = 23
+LM_RIGHT_HIP = 24
+LM_LEFT_KNEE = 25
+LM_RIGHT_KNEE = 26
+LM_LEFT_ANKLE = 27
+LM_RIGHT_ANKLE = 28
+LM_LEFT_EAR = 7
+LM_RIGHT_EAR = 8
+
+# Minimum visibility score to trust a landmark
+MIN_VISIBILITY = 0.5
 
 # Anthropometric measurement bounds (cm) for sanity checking
 MALE_BOUNDS = {
@@ -70,11 +92,58 @@ STAT_COEFFICIENTS = {
     },
 }
 
+# Typical depth-to-width ratios by body region (front width -> side depth)
+# Based on anthropometric data; used when side landmarks aren't available
+DEPTH_RATIOS = {
+    "chest": {"male": 0.75, "female": 0.70},
+    "waist": {"male": 0.80, "female": 0.72},
+    "hips": {"male": 0.70, "female": 0.75},
+    "neck": {"male": 0.85, "female": 0.82},
+}
+
 
 def decode_image(base64_str: str) -> np.ndarray:
     img_bytes = base64.b64decode(base64_str)
     nparr = np.frombuffer(img_bytes, np.uint8)
     return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+
+def detect_pose_landmarks(image: np.ndarray) -> list | None:
+    """
+    Detect body pose landmarks using MediaPipe Pose.
+    Returns list of 33 landmarks with x, y, z, visibility, or None if detection fails.
+    """
+    mp_pose = mp.solutions.pose
+    with mp_pose.Pose(
+        static_image_mode=True,
+        model_complexity=2,
+        enable_segmentation=False,
+        min_detection_confidence=0.5,
+    ) as pose:
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        results = pose.process(image_rgb)
+
+        if results.pose_landmarks is None:
+            return None
+
+        return results.pose_landmarks.landmark
+
+
+def landmark_pixel(landmark, img_h: int, img_w: int) -> tuple[float, float]:
+    """Convert normalized landmark coordinates to pixel coordinates."""
+    return landmark.x * img_w, landmark.y * img_h
+
+
+def landmark_distance_px(lm1, lm2, img_h: int, img_w: int) -> float:
+    """Euclidean distance between two landmarks in pixels."""
+    x1, y1 = landmark_pixel(lm1, img_h, img_w)
+    x2, y2 = landmark_pixel(lm2, img_h, img_w)
+    return np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+
+
+def landmarks_visible(landmarks: list, indices: list[int]) -> bool:
+    """Check if all specified landmarks have sufficient visibility."""
+    return all(landmarks[i].visibility >= MIN_VISIBILITY for i in indices)
 
 
 def extract_silhouette(image: np.ndarray) -> np.ndarray:
@@ -89,12 +158,234 @@ def extract_silhouette(image: np.ndarray) -> np.ndarray:
 
     mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype("uint8")
 
-    # Morphological cleanup: close gaps, remove noise
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     mask2 = cv2.morphologyEx(mask2, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask2 = cv2.morphologyEx(mask2, cv2.MORPH_OPEN, kernel, iterations=1)
 
     return mask2
+
+
+def width_at_row(silhouette: np.ndarray, row: int, px_to_cm: float) -> float:
+    """Get body width in cm at a specific pixel row from a silhouette."""
+    row = max(0, min(row, silhouette.shape[0] - 1))
+    # Average over a small window for stability
+    rows_to_check = range(max(0, row - 3), min(silhouette.shape[0], row + 4))
+    widths = []
+    for r in rows_to_check:
+        cols = np.where(silhouette[r] > 0)[0]
+        if len(cols) >= 2:
+            widths.append(float(cols[-1] - cols[0]) * px_to_cm)
+    return float(np.median(widths)) if widths else 0.0
+
+
+def circumference_from_widths(front_width_cm: float, side_depth_cm: float) -> float:
+    """
+    Estimate circumference from front width and side depth using
+    Ramanujan's ellipse perimeter approximation.
+    """
+    a = front_width_cm / 2
+    b = side_depth_cm / 2
+    if a <= 0 or b <= 0:
+        return 0.0
+    h_val = ((a - b) / (a + b)) ** 2
+    return float(np.pi * (a + b) * (1 + 3 * h_val / (10 + np.sqrt(4 - 3 * h_val))))
+
+
+def estimate_from_landmarks(
+    front_landmarks: list,
+    front_image: np.ndarray,
+    side_image: np.ndarray,
+    height_cm: float,
+    gender: Gender,
+) -> dict[str, float]:
+    """
+    Estimate body measurements using MediaPipe Pose landmarks from the front image
+    combined with silhouette width from the side image for depth.
+    """
+    img_h, img_w = front_image.shape[:2]
+    gender_key = gender.value
+
+    # Calculate pixel-to-cm ratio from known height
+    # Use ankle-to-top-of-head distance for calibration
+    if landmarks_visible(front_landmarks, [LM_NOSE, LM_LEFT_ANKLE, LM_RIGHT_ANKLE]):
+        # Top of head is roughly 10% of head height above nose
+        _, nose_y = landmark_pixel(front_landmarks[LM_NOSE], img_h, img_w)
+        _, left_ankle_y = landmark_pixel(front_landmarks[LM_LEFT_ANKLE], img_h, img_w)
+        _, right_ankle_y = landmark_pixel(front_landmarks[LM_RIGHT_ANKLE], img_h, img_w)
+        ankle_y = (left_ankle_y + right_ankle_y) / 2
+
+        # Estimate head top from ear-to-nose distance
+        if landmarks_visible(front_landmarks, [LM_LEFT_EAR]):
+            _, ear_y = landmark_pixel(front_landmarks[LM_LEFT_EAR], img_h, img_w)
+            head_above_nose = abs(nose_y - ear_y) * 1.2
+        else:
+            head_above_nose = (ankle_y - nose_y) * 0.06
+
+        head_top_y = nose_y - head_above_nose
+        pixel_height = ankle_y - head_top_y
+    else:
+        # Fallback: use image bounds
+        pixel_height = img_h * 0.9
+
+    if pixel_height <= 0:
+        return {}
+
+    px_to_cm = height_cm / pixel_height
+
+    # --- Shoulder width ---
+    shoulder_width = 0.0
+    if landmarks_visible(front_landmarks, [LM_LEFT_SHOULDER, LM_RIGHT_SHOULDER]):
+        shoulder_width = landmark_distance_px(
+            front_landmarks[LM_LEFT_SHOULDER],
+            front_landmarks[LM_RIGHT_SHOULDER],
+            img_h, img_w,
+        ) * px_to_cm
+
+    # --- Arm length (shoulder -> elbow -> wrist) ---
+    arm_length = 0.0
+    # Try left arm first, then right
+    for shoulder_idx, elbow_idx, wrist_idx in [
+        (LM_LEFT_SHOULDER, LM_LEFT_ELBOW, LM_LEFT_WRIST),
+        (LM_RIGHT_SHOULDER, LM_RIGHT_ELBOW, LM_RIGHT_WRIST),
+    ]:
+        if landmarks_visible(front_landmarks, [shoulder_idx, elbow_idx, wrist_idx]):
+            upper = landmark_distance_px(
+                front_landmarks[shoulder_idx], front_landmarks[elbow_idx], img_h, img_w
+            )
+            lower = landmark_distance_px(
+                front_landmarks[elbow_idx], front_landmarks[wrist_idx], img_h, img_w
+            )
+            arm_length = (upper + lower) * px_to_cm
+            break
+
+    # --- Torso length (mid-shoulder to mid-hip) ---
+    torso_length = 0.0
+    if landmarks_visible(front_landmarks, [
+        LM_LEFT_SHOULDER, LM_RIGHT_SHOULDER, LM_LEFT_HIP, LM_RIGHT_HIP,
+    ]):
+        _, ls_y = landmark_pixel(front_landmarks[LM_LEFT_SHOULDER], img_h, img_w)
+        _, rs_y = landmark_pixel(front_landmarks[LM_RIGHT_SHOULDER], img_h, img_w)
+        _, lh_y = landmark_pixel(front_landmarks[LM_LEFT_HIP], img_h, img_w)
+        _, rh_y = landmark_pixel(front_landmarks[LM_RIGHT_HIP], img_h, img_w)
+        mid_shoulder_y = (ls_y + rs_y) / 2
+        mid_hip_y = (lh_y + rh_y) / 2
+        torso_length = abs(mid_hip_y - mid_shoulder_y) * px_to_cm
+
+    # --- Circumferences: use landmark Y positions to sample silhouette widths ---
+    # Extract side silhouette for depth measurements
+    side_sil = extract_silhouette(side_image)
+    side_h, side_w = side_image.shape[:2]
+    side_px_to_cm = height_cm / (side_h * 0.9)  # approximate
+
+    # If we have side landmarks, use them for better calibration
+    side_landmarks = detect_pose_landmarks(side_image)
+    if side_landmarks and landmarks_visible(side_landmarks, [LM_NOSE, LM_LEFT_ANKLE]):
+        _, s_nose_y = landmark_pixel(side_landmarks[LM_NOSE], side_h, side_w)
+        _, s_ankle_y = landmark_pixel(side_landmarks[LM_LEFT_ANKLE], side_h, side_w)
+        s_pixel_height = s_ankle_y - s_nose_y
+        if s_pixel_height > 0:
+            # Nose to ankle is roughly 90% of height
+            side_px_to_cm = (height_cm * 0.90) / s_pixel_height
+
+    # Also get front silhouette for front widths
+    front_sil = extract_silhouette(front_image)
+
+    # Chest: at the level ~40% between shoulder and hip
+    chest_cm = 0.0
+    if landmarks_visible(front_landmarks, [
+        LM_LEFT_SHOULDER, LM_RIGHT_SHOULDER, LM_LEFT_HIP, LM_RIGHT_HIP,
+    ]):
+        _, ls_y = landmark_pixel(front_landmarks[LM_LEFT_SHOULDER], img_h, img_w)
+        _, rs_y = landmark_pixel(front_landmarks[LM_RIGHT_SHOULDER], img_h, img_w)
+        _, lh_y = landmark_pixel(front_landmarks[LM_LEFT_HIP], img_h, img_w)
+        _, rh_y = landmark_pixel(front_landmarks[LM_RIGHT_HIP], img_h, img_w)
+        mid_shoulder_y = (ls_y + rs_y) / 2
+        mid_hip_y = (lh_y + rh_y) / 2
+
+        # Chest at 30% down from shoulders to hips
+        chest_row_front = int(mid_shoulder_y + (mid_hip_y - mid_shoulder_y) * 0.30)
+        chest_front_w = width_at_row(front_sil, chest_row_front, px_to_cm)
+
+        # Map front row ratio to side image
+        front_ratio = chest_row_front / img_h
+        chest_row_side = int(front_ratio * side_h)
+        chest_side_d = width_at_row(side_sil, chest_row_side, side_px_to_cm)
+
+        if chest_side_d <= 0:
+            chest_side_d = chest_front_w * DEPTH_RATIOS["chest"][gender_key]
+
+        chest_cm = circumference_from_widths(chest_front_w, chest_side_d)
+
+    # Waist: at ~65% between shoulder and hip
+    waist_cm = 0.0
+    if landmarks_visible(front_landmarks, [
+        LM_LEFT_SHOULDER, LM_RIGHT_SHOULDER, LM_LEFT_HIP, LM_RIGHT_HIP,
+    ]):
+        waist_row_front = int(mid_shoulder_y + (mid_hip_y - mid_shoulder_y) * 0.65)
+        waist_front_w = width_at_row(front_sil, waist_row_front, px_to_cm)
+
+        front_ratio = waist_row_front / img_h
+        waist_row_side = int(front_ratio * side_h)
+        waist_side_d = width_at_row(side_sil, waist_row_side, side_px_to_cm)
+
+        if waist_side_d <= 0:
+            waist_side_d = waist_front_w * DEPTH_RATIOS["waist"][gender_key]
+
+        waist_cm = circumference_from_widths(waist_front_w, waist_side_d)
+
+    # Hips: at ~110% of shoulder-to-hip distance (just below hip landmarks)
+    hips_cm = 0.0
+    if landmarks_visible(front_landmarks, [LM_LEFT_HIP, LM_RIGHT_HIP]):
+        _, lh_y = landmark_pixel(front_landmarks[LM_LEFT_HIP], img_h, img_w)
+        _, rh_y = landmark_pixel(front_landmarks[LM_RIGHT_HIP], img_h, img_w)
+        hip_row_front = int((lh_y + rh_y) / 2)
+        hip_front_w = width_at_row(front_sil, hip_row_front, px_to_cm)
+
+        front_ratio = hip_row_front / img_h
+        hip_row_side = int(front_ratio * side_h)
+        hip_side_d = width_at_row(side_sil, hip_row_side, side_px_to_cm)
+
+        if hip_side_d <= 0:
+            hip_side_d = hip_front_w * DEPTH_RATIOS["hips"][gender_key]
+
+        hips_cm = circumference_from_widths(hip_front_w, hip_side_d)
+
+    # Neck: midpoint between ears/nose and shoulders
+    neck_cm = 0.0
+    if landmarks_visible(front_landmarks, [LM_NOSE, LM_LEFT_SHOULDER, LM_RIGHT_SHOULDER]):
+        _, nose_y = landmark_pixel(front_landmarks[LM_NOSE], img_h, img_w)
+        _, ls_y = landmark_pixel(front_landmarks[LM_LEFT_SHOULDER], img_h, img_w)
+        _, rs_y = landmark_pixel(front_landmarks[LM_RIGHT_SHOULDER], img_h, img_w)
+        mid_shoulder_y = (ls_y + rs_y) / 2
+        neck_row_front = int((nose_y + mid_shoulder_y) / 2)
+        neck_front_w = width_at_row(front_sil, neck_row_front, px_to_cm)
+
+        front_ratio = neck_row_front / img_h
+        neck_row_side = int(front_ratio * side_h)
+        neck_side_d = width_at_row(side_sil, neck_row_side, side_px_to_cm)
+
+        if neck_side_d <= 0:
+            neck_side_d = neck_front_w * DEPTH_RATIOS["neck"][gender_key]
+
+        neck_cm = circumference_from_widths(neck_front_w, neck_side_d)
+
+    result = {}
+    if shoulder_width > 0:
+        result["shoulder_width"] = round(shoulder_width, 1)
+    if arm_length > 0:
+        result["arm_length"] = round(arm_length, 1)
+    if torso_length > 0:
+        result["torso_length"] = round(torso_length, 1)
+    if chest_cm > 0:
+        result["chest"] = round(chest_cm, 1)
+    if waist_cm > 0:
+        result["waist"] = round(waist_cm, 1)
+    if hips_cm > 0:
+        result["hips"] = round(hips_cm, 1)
+    if neck_cm > 0:
+        result["neck"] = round(neck_cm, 1)
+
+    return result
 
 
 def statistical_estimate(
@@ -117,124 +408,35 @@ def statistical_estimate(
     return result
 
 
-def estimate_proportions_from_silhouette(
-    front_silhouette: np.ndarray,
-    side_silhouette: np.ndarray,
-    height_cm: float,
-) -> dict[str, float]:
-    """
-    Estimate body proportions from front and side silhouettes.
-    Uses pixel ratios scaled by known height.
-    """
-    front_h = front_silhouette.shape[0]
-
-    # Find body bounds in front view
-    rows_with_body = np.any(front_silhouette > 0, axis=1)
-    if not np.any(rows_with_body):
-        return {}
-
-    body_top = int(np.argmax(rows_with_body))
-    body_bottom = int(front_h - np.argmax(rows_with_body[::-1]))
-    pixel_height = body_bottom - body_top
-    if pixel_height <= 0:
-        return {}
-
-    px_to_cm = height_cm / pixel_height
-
-    def width_at_ratio(silhouette: np.ndarray, ratio: float) -> float:
-        """Get the body width at a given vertical ratio from top of body."""
-        row = int(body_top + pixel_height * ratio)
-        row = max(0, min(row, silhouette.shape[0] - 1))
-        cols = np.where(silhouette[row] > 0)[0]
-        if len(cols) < 2:
-            return 0.0
-        return float(cols[-1] - cols[0]) * px_to_cm
-
-    def stable_width_at_ratio(silhouette: np.ndarray, ratio: float, window: int = 5) -> float:
-        """Average width over several rows for stability."""
-        widths = []
-        for offset in range(-window, window + 1):
-            r = ratio + offset * (0.005)  # sample ~1% range
-            w = width_at_ratio(silhouette, r)
-            if w > 0:
-                widths.append(w)
-        return float(np.median(widths)) if widths else 0.0
-
-    # Front view widths at anatomical landmarks
-    # Ratios calibrated to standing pose proportions
-    shoulder_width = stable_width_at_ratio(front_silhouette, 0.19)
-    chest_front = stable_width_at_ratio(front_silhouette, 0.32)
-    waist_front = stable_width_at_ratio(front_silhouette, 0.43)
-    hip_front = stable_width_at_ratio(front_silhouette, 0.53)
-
-    # Side view depths
-    chest_side = stable_width_at_ratio(side_silhouette, 0.32)
-    waist_side = stable_width_at_ratio(side_silhouette, 0.43)
-    hip_side = stable_width_at_ratio(side_silhouette, 0.53)
-
-    # Circumferences using Ramanujan's ellipse approximation:
-    # C ≈ π * (3(a+b) - sqrt((3a+b)(a+3b)))
-    # where a = front half-width, b = side half-depth
-    def circumference(front_w: float, side_d: float) -> float:
-        a = front_w / 2
-        b = side_d / 2
-        if a <= 0 or b <= 0:
-            return 0.0
-        h_val = ((a - b) / (a + b)) ** 2
-        return float(np.pi * (a + b) * (1 + 3 * h_val / (10 + np.sqrt(4 - 3 * h_val))))
-
-    # Torso length from shoulder to waist
-    torso_px = pixel_height * 0.24
-    torso_length = torso_px * px_to_cm
-
-    # Arm length from shoulder to wrist (~44% of height)
-    arm_length = height_cm * 0.44
-
-    # Neck circumference
-    neck_front = stable_width_at_ratio(front_silhouette, 0.13)
-    neck_side = stable_width_at_ratio(side_silhouette, 0.13)
-    neck = circumference(neck_front, neck_side)
-
-    return {
-        "chest": round(circumference(chest_front, chest_side), 1),
-        "waist": round(circumference(waist_front, waist_side), 1),
-        "hips": round(circumference(hip_front, hip_side), 1),
-        "shoulder_width": round(shoulder_width, 1),
-        "arm_length": round(arm_length, 1),
-        "neck": round(neck, 1),
-        "torso_length": round(torso_length, 1),
-    }
-
-
 def blend_measurements(
-    silhouette_props: dict[str, float],
+    landmark_props: dict[str, float],
     stat_estimate: dict[str, float],
     gender: Gender,
-    silhouette_weight: float = 0.6,
+    landmark_weight: float = 0.7,
 ) -> dict[str, float]:
     """
-    Blend silhouette-derived measurements with statistical estimates.
-    Uses bounds to validate silhouette values — if out of range,
-    falls back more heavily to statistical estimate.
+    Blend landmark-derived measurements with statistical estimates.
+    Landmarks get higher trust (0.7) than the old silhouette approach (0.6)
+    because MediaPipe provides actual joint positions.
     """
     bounds = MALE_BOUNDS if gender == Gender.male else FEMALE_BOUNDS
     result = {}
 
     for key in stat_estimate:
         stat_val = stat_estimate[key]
-        sil_val = silhouette_props.get(key, 0.0)
+        lm_val = landmark_props.get(key, 0.0)
         lo, hi = bounds[key]
 
-        if sil_val <= 0 or sil_val < lo * 0.7 or sil_val > hi * 1.3:
-            # Silhouette value is missing or wildly out of range — use stats
+        if lm_val <= 0 or lm_val < lo * 0.7 or lm_val > hi * 1.3:
+            # Landmark value is missing or wildly out of range — use stats
             result[key] = stat_val
-        elif sil_val < lo or sil_val > hi:
+        elif lm_val < lo or lm_val > hi:
             # Slightly out of range — lean toward stats
-            blended = sil_val * 0.3 + stat_val * 0.7
+            blended = lm_val * 0.3 + stat_val * 0.7
             result[key] = round(max(lo, min(hi, blended)), 1)
         else:
-            # In range — blend normally
-            blended = sil_val * silhouette_weight + stat_val * (1 - silhouette_weight)
+            # In range — blend with higher trust for landmarks
+            blended = lm_val * landmark_weight + stat_val * (1 - landmark_weight)
             result[key] = round(blended, 1)
 
     return result
@@ -318,17 +520,23 @@ def process_body_scan(
     front_img = decode_image(front_image_b64)
     side_img = decode_image(side_image_b64)
 
-    front_sil = extract_silhouette(front_img)
-    side_sil = extract_silhouette(side_img)
+    # Try MediaPipe Pose landmark detection on front image
+    front_landmarks = detect_pose_landmarks(front_img)
 
-    # Get silhouette-based proportions
-    silhouette_props = estimate_proportions_from_silhouette(front_sil, side_sil, height_cm)
+    if front_landmarks is not None:
+        # Use landmark-based measurement extraction
+        landmark_props = estimate_from_landmarks(
+            front_landmarks, front_img, side_img, height_cm, gender,
+        )
+    else:
+        # MediaPipe failed — fall back to silhouette-only approach
+        landmark_props = _fallback_silhouette_estimate(front_img, side_img, height_cm)
 
     # Get statistical baseline from height/weight
     stat_props = statistical_estimate(height_cm, weight_kg, gender)
 
-    # Blend: trust silhouette when it's reasonable, fall back to stats otherwise
-    final_measurements = blend_measurements(silhouette_props, stat_props, gender)
+    # Blend: trust landmarks when reasonable, fall back to stats otherwise
+    final_measurements = blend_measurements(landmark_props, stat_props, gender)
 
     betas = silhouette_to_smplx_betas(final_measurements, gender, height_cm, weight_kg)
 
@@ -343,3 +551,56 @@ def process_body_scan(
     )
 
     return measurements, betas, mesh_bytes
+
+
+def _fallback_silhouette_estimate(
+    front_img: np.ndarray,
+    side_img: np.ndarray,
+    height_cm: float,
+) -> dict[str, float]:
+    """
+    Fallback when MediaPipe can't detect a pose.
+    Uses the old silhouette + hardcoded ratio approach.
+    """
+    front_sil = extract_silhouette(front_img)
+    side_sil = extract_silhouette(side_img)
+
+    front_h = front_sil.shape[0]
+    rows_with_body = np.any(front_sil > 0, axis=1)
+    if not np.any(rows_with_body):
+        return {}
+
+    body_top = int(np.argmax(rows_with_body))
+    body_bottom = int(front_h - np.argmax(rows_with_body[::-1]))
+    pixel_height = body_bottom - body_top
+    if pixel_height <= 0:
+        return {}
+
+    px_to_cm = height_cm / pixel_height
+
+    def stable_width(silhouette, ratio, window=5):
+        widths = []
+        for offset in range(-window, window + 1):
+            row = int(body_top + pixel_height * (ratio + offset * 0.005))
+            row = max(0, min(row, silhouette.shape[0] - 1))
+            cols = np.where(silhouette[row] > 0)[0]
+            if len(cols) >= 2:
+                widths.append(float(cols[-1] - cols[0]) * px_to_cm)
+        return float(np.median(widths)) if widths else 0.0
+
+    def circ(front_w, side_d):
+        a, b = front_w / 2, side_d / 2
+        if a <= 0 or b <= 0:
+            return 0.0
+        h_val = ((a - b) / (a + b)) ** 2
+        return float(np.pi * (a + b) * (1 + 3 * h_val / (10 + np.sqrt(4 - 3 * h_val))))
+
+    return {
+        "chest": round(circ(stable_width(front_sil, 0.32), stable_width(side_sil, 0.32)), 1),
+        "waist": round(circ(stable_width(front_sil, 0.43), stable_width(side_sil, 0.43)), 1),
+        "hips": round(circ(stable_width(front_sil, 0.53), stable_width(side_sil, 0.53)), 1),
+        "shoulder_width": round(stable_width(front_sil, 0.19), 1),
+        "arm_length": round(height_cm * 0.44, 1),
+        "neck": round(circ(stable_width(front_sil, 0.13), stable_width(side_sil, 0.13)), 1),
+        "torso_length": round(pixel_height * 0.24 * px_to_cm, 1),
+    }
