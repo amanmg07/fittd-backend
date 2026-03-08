@@ -1,5 +1,5 @@
 """
-AI Virtual Try-On using IDM-VTON via Hugging Face Spaces.
+AI Virtual Try-On using IDM-VTON via Replicate.
 
 Sends a person photo + garment image to the model and gets back
 a realistic composite image of the person wearing the garment.
@@ -17,18 +17,13 @@ import httpx
 import cv2
 import numpy as np
 import mediapipe as mp
+import replicate
+
+
+# Keep gradio_client for background removal (free HF Space)
 from gradio_client import Client, handle_file
 
-
-_vton_client: Client | None = None
 _rembg_client: Client | None = None
-
-
-def get_vton_client() -> Client:
-    global _vton_client
-    if _vton_client is None:
-        _vton_client = Client("yisol/IDM-VTON")
-    return _vton_client
 
 
 def get_rembg_client() -> Client:
@@ -317,6 +312,16 @@ def preprocess_garment_image(image_url: str) -> str:
     return tmp.name
 
 
+def _image_path_to_data_uri(path: str) -> str:
+    """Convert a local image file to a data URI for Replicate input."""
+    with open(path, "rb") as f:
+        data = f.read()
+    ext = os.path.splitext(path)[1].lower()
+    mime = "image/png" if ext == ".png" else "image/jpeg"
+    b64 = base64.b64encode(data).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
 def try_on_image(
     person_image_b64: str,
     garment_image_url: str,
@@ -325,35 +330,38 @@ def try_on_image(
     seed: int = 42,
 ) -> str:
     """
-    Run AI virtual try-on.
+    Run AI virtual try-on via Replicate (cuuupid/idm-vton).
     Returns base64 encoded result image.
     """
     person_path = preprocess_person_image(person_image_b64)
     garment_path = preprocess_garment_image(garment_image_url)
 
     try:
-        client = get_vton_client()
+        person_uri = _image_path_to_data_uri(person_path)
+        garment_uri = _image_path_to_data_uri(garment_path)
 
-        result = client.predict(
-            dict={
-                "background": handle_file(person_path),
-                "layers": [],
-                "composite": None,
+        output = replicate.run(
+            "cuuupid/idm-vton",
+            input={
+                "human_img": person_uri,
+                "garm_img": garment_uri,
+                "garment_des": garment_description,
+                "category": "upper_body",
+                "crop": False,
+                "seed": seed,
+                "steps": denoise_steps,
             },
-            garm_img=handle_file(garment_path),
-            garment_des=garment_description,
-            is_checked=True,
-            is_checked_crop=False,
-            denoise_steps=denoise_steps,
-            seed=seed,
-            api_name="/tryon",
         )
 
-        result_path = result[0]
+        # Replicate returns a URL to the output image
+        result_url = output if isinstance(output, str) else str(output)
 
-        with open(result_path, "rb") as f:
-            result_b64 = base64.b64encode(f.read()).decode("utf-8")
+        # Download the result image
+        with httpx.Client(timeout=60.0, follow_redirects=True) as http:
+            resp = http.get(result_url)
+            resp.raise_for_status()
 
+        result_b64 = base64.b64encode(resp.content).decode("utf-8")
         return result_b64
 
     finally:
@@ -377,7 +385,7 @@ async def try_on_image_async(
     garment_description: str = "",
 ) -> str:
     """
-    Async wrapper — runs the blocking gradio call in a thread.
+    Async wrapper — runs the blocking Replicate call in a thread.
     """
     import asyncio
     loop = asyncio.get_event_loop()
@@ -392,49 +400,38 @@ async def try_on_image_async(
 
 # --- Novel View Synthesis (360° rotation) ---
 
-_zero123_client: Client | None = None
-
-
-def get_zero123_client() -> Client:
-    global _zero123_client
-    if _zero123_client is None:
-        _zero123_client = Client("sudo-ai/zero123plus-v1.2")
-    return _zero123_client
-
 
 def generate_novel_views(front_image_b64: str, num_views: int = 12) -> list[dict]:
     """
-    Generate multiple rotated views from a single front image using Zero123++.
+    Generate multiple rotated views from a single front image using
+    Zero123++ on Replicate.
     Returns a list of {"angle_deg": int, "image_b64": str}.
-
-    Zero123++ generates 6 views at fixed angles from a single input.
-    We call it and also mirror some views to fill out the full rotation.
     """
-    # Save input image to temp file
     img_bytes = base64.b64decode(front_image_b64)
-    img = Image.open(io.BytesIO(img_bytes))
-    if img.mode != "RGB":
-        img = img.convert("RGB")
 
-    tmp_in = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-    img.save(tmp_in.name, "PNG")
+    # Build data URI for Replicate
+    input_uri = f"data:image/png;base64,{front_image_b64}"
 
     try:
-        client = get_zero123_client()
-
-        # Zero123++ v1.2 generates a grid of 6 views
-        result = client.predict(
-            handle_file(tmp_in.name),
-            75,      # num_inference_steps
-            10.0,    # guidance_scale
-            api_name="/generate",
+        output = replicate.run(
+            "jd7h/zero123plus",
+            input={
+                "image": input_uri,
+                "num_inference_steps": 75,
+                "guidance_scale": 10.0,
+            },
         )
 
-        result_path = result if isinstance(result, str) else result[0]
-        result_img = Image.open(result_path)
+        result_url = output if isinstance(output, str) else str(output)
+
+        # Download the result grid
+        with httpx.Client(timeout=60.0, follow_redirects=True) as http:
+            resp = http.get(result_url)
+            resp.raise_for_status()
+
+        result_img = Image.open(io.BytesIO(resp.content))
 
         # Zero123++ outputs a 3x2 grid (3 cols x 2 rows)
-        # Each cell is a different angle view
         grid_w, grid_h = result_img.size
         cell_w = grid_w // 3
         cell_h = grid_h // 2
@@ -449,7 +446,10 @@ def generate_novel_views(front_image_b64: str, num_views: int = 12) -> list[dict
 
         views = []
         # Include the original front as 0°
+        img = Image.open(io.BytesIO(img_bytes))
         buf = io.BytesIO()
+        if img.mode != "RGB":
+            img = img.convert("RGB")
         img.save(buf, format="PNG")
         views.append({"angle_deg": 0, "image_b64": base64.b64encode(buf.getvalue()).decode()})
 
@@ -467,11 +467,8 @@ def generate_novel_views(front_image_b64: str, num_views: int = 12) -> list[dict
         # Sort by angle
         views.sort(key=lambda v: v["angle_deg"])
 
-        # Generate intermediate angles by mirroring to fill gaps
-        # Mirror 30° → 330° if not present, etc.
-        filled = {v["angle_deg"]: v for v in views}
-
         # Add 180° by mirroring 0° if not present
+        filled = {v["angle_deg"]: v for v in views}
         if 180 not in filled:
             mirrored = mirror_image_b64(front_image_b64)
             filled[180] = {"angle_deg": 180, "image_b64": mirrored}
@@ -479,16 +476,13 @@ def generate_novel_views(front_image_b64: str, num_views: int = 12) -> list[dict
         final_views = sorted(filled.values(), key=lambda v: v["angle_deg"])
         return final_views
 
-    except Exception as e:
+    except Exception:
         # Fallback: generate basic views from the front image using mirrors
         views = [
             {"angle_deg": 0, "image_b64": front_image_b64},
             {"angle_deg": 180, "image_b64": mirror_image_b64(front_image_b64)},
         ]
         return views
-
-    finally:
-        os.unlink(tmp_in.name)
 
 
 async def generate_novel_views_async(front_image_b64: str, num_views: int = 12) -> list[dict]:
