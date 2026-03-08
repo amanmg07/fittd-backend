@@ -265,7 +265,7 @@ def try_on_image(
         garment_uri = _image_path_to_data_uri(garment_path)
 
         output = replicate.run(
-            "cuuupid/idm-vton",
+            "cuuupid/idm-vton:0513734a452173b8173e907e3a59d19a36266e55b48528559432bd21c7d7e985",
             input={
                 "human_img": person_uri,
                 "garm_img": garment_uri,
