@@ -147,7 +147,26 @@ def landmarks_visible(landmarks: list, indices: list[int]) -> bool:
 
 
 def extract_silhouette(image: np.ndarray) -> np.ndarray:
-    """Extract human silhouette using GrabCut with morphological refinement."""
+    """
+    Extract human silhouette using MediaPipe Selfie Segmentation.
+    Falls back to GrabCut if MediaPipe fails.
+    """
+    mp_selfie = mp.solutions.selfie_segmentation
+    with mp_selfie.SelfieSegmentation(model_selection=1) as seg:
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        results = seg.process(image_rgb)
+
+        if results.segmentation_mask is not None:
+            # Threshold the probability mask at 0.5
+            mask = (results.segmentation_mask > 0.5).astype(np.uint8)
+
+            # Morphological cleanup
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+            return mask
+
+    # Fallback: GrabCut
     mask = np.zeros(image.shape[:2], np.uint8)
     bgd_model = np.zeros((1, 65), np.float64)
     fgd_model = np.zeros((1, 65), np.float64)
@@ -277,20 +296,66 @@ def estimate_from_landmarks(
     side_h, side_w = side_image.shape[:2]
     side_px_to_cm = height_cm / (side_h * 0.9)  # approximate
 
-    # If we have side landmarks, use them for better calibration
+    # Detect side landmarks for better row mapping and calibration
     side_landmarks = detect_pose_landmarks(side_image)
-    if side_landmarks and landmarks_visible(side_landmarks, [LM_NOSE, LM_LEFT_ANKLE]):
-        _, s_nose_y = landmark_pixel(side_landmarks[LM_NOSE], side_h, side_w)
-        _, s_ankle_y = landmark_pixel(side_landmarks[LM_LEFT_ANKLE], side_h, side_w)
-        s_pixel_height = s_ankle_y - s_nose_y
-        if s_pixel_height > 0:
-            # Nose to ankle is roughly 90% of height
-            side_px_to_cm = (height_cm * 0.90) / s_pixel_height
+    side_has_torso = False
+    side_shoulder_y = None
+    side_hip_y = None
+    side_nose_y = None
+
+    if side_landmarks:
+        # Calibrate side px_to_cm using side landmarks
+        if landmarks_visible(side_landmarks, [LM_NOSE, LM_LEFT_ANKLE]):
+            _, s_nose_y = landmark_pixel(side_landmarks[LM_NOSE], side_h, side_w)
+            _, s_ankle_y = landmark_pixel(side_landmarks[LM_LEFT_ANKLE], side_h, side_w)
+            s_pixel_height = s_ankle_y - s_nose_y
+            if s_pixel_height > 0:
+                side_px_to_cm = (height_cm * 0.90) / s_pixel_height
+        elif landmarks_visible(side_landmarks, [LM_NOSE, LM_RIGHT_ANKLE]):
+            _, s_nose_y = landmark_pixel(side_landmarks[LM_NOSE], side_h, side_w)
+            _, s_ankle_y = landmark_pixel(side_landmarks[LM_RIGHT_ANKLE], side_h, side_w)
+            s_pixel_height = s_ankle_y - s_nose_y
+            if s_pixel_height > 0:
+                side_px_to_cm = (height_cm * 0.90) / s_pixel_height
+
+        # Get side torso landmark rows for direct row mapping
+        side_shoulder_indices = [LM_LEFT_SHOULDER, LM_RIGHT_SHOULDER]
+        side_hip_indices = [LM_LEFT_HIP, LM_RIGHT_HIP]
+
+        visible_shoulder_ys = []
+        for idx in side_shoulder_indices:
+            if side_landmarks[idx].visibility >= MIN_VISIBILITY:
+                _, sy = landmark_pixel(side_landmarks[idx], side_h, side_w)
+                visible_shoulder_ys.append(sy)
+        if visible_shoulder_ys:
+            side_shoulder_y = sum(visible_shoulder_ys) / len(visible_shoulder_ys)
+
+        visible_hip_ys = []
+        for idx in side_hip_indices:
+            if side_landmarks[idx].visibility >= MIN_VISIBILITY:
+                _, hy = landmark_pixel(side_landmarks[idx], side_h, side_w)
+                visible_hip_ys.append(hy)
+        if visible_hip_ys:
+            side_hip_y = sum(visible_hip_ys) / len(visible_hip_ys)
+
+        if side_landmarks[LM_NOSE].visibility >= MIN_VISIBILITY:
+            _, side_nose_y = landmark_pixel(side_landmarks[LM_NOSE], side_h, side_w)
+
+        side_has_torso = side_shoulder_y is not None and side_hip_y is not None
+
+    def _side_row_for_front_ratio(front_row: int, front_shoulder_y: float, front_hip_y: float) -> int:
+        """Map a front-image row to the corresponding side-image row using landmarks."""
+        if side_has_torso and front_hip_y > front_shoulder_y:
+            # Use landmark-based proportional mapping within the torso
+            torso_ratio = (front_row - front_shoulder_y) / (front_hip_y - front_shoulder_y)
+            return int(side_shoulder_y + torso_ratio * (side_hip_y - side_shoulder_y))
+        # Fallback: raw pixel ratio
+        return int((front_row / img_h) * side_h)
 
     # Also get front silhouette for front widths
     front_sil = extract_silhouette(front_image)
 
-    # Chest: at the level ~40% between shoulder and hip
+    # Chest: at the level ~30% between shoulder and hip
     chest_cm = 0.0
     if landmarks_visible(front_landmarks, [
         LM_LEFT_SHOULDER, LM_RIGHT_SHOULDER, LM_LEFT_HIP, LM_RIGHT_HIP,
@@ -306,9 +371,7 @@ def estimate_from_landmarks(
         chest_row_front = int(mid_shoulder_y + (mid_hip_y - mid_shoulder_y) * 0.30)
         chest_front_w = width_at_row(front_sil, chest_row_front, px_to_cm)
 
-        # Map front row ratio to side image
-        front_ratio = chest_row_front / img_h
-        chest_row_side = int(front_ratio * side_h)
+        chest_row_side = _side_row_for_front_ratio(chest_row_front, mid_shoulder_y, mid_hip_y)
         chest_side_d = width_at_row(side_sil, chest_row_side, side_px_to_cm)
 
         if chest_side_d <= 0:
@@ -324,8 +387,7 @@ def estimate_from_landmarks(
         waist_row_front = int(mid_shoulder_y + (mid_hip_y - mid_shoulder_y) * 0.65)
         waist_front_w = width_at_row(front_sil, waist_row_front, px_to_cm)
 
-        front_ratio = waist_row_front / img_h
-        waist_row_side = int(front_ratio * side_h)
+        waist_row_side = _side_row_for_front_ratio(waist_row_front, mid_shoulder_y, mid_hip_y)
         waist_side_d = width_at_row(side_sil, waist_row_side, side_px_to_cm)
 
         if waist_side_d <= 0:
@@ -333,7 +395,7 @@ def estimate_from_landmarks(
 
         waist_cm = circumference_from_widths(waist_front_w, waist_side_d)
 
-    # Hips: at ~110% of shoulder-to-hip distance (just below hip landmarks)
+    # Hips: at hip landmark level
     hips_cm = 0.0
     if landmarks_visible(front_landmarks, [LM_LEFT_HIP, LM_RIGHT_HIP]):
         _, lh_y = landmark_pixel(front_landmarks[LM_LEFT_HIP], img_h, img_w)
@@ -341,8 +403,11 @@ def estimate_from_landmarks(
         hip_row_front = int((lh_y + rh_y) / 2)
         hip_front_w = width_at_row(front_sil, hip_row_front, px_to_cm)
 
-        front_ratio = hip_row_front / img_h
-        hip_row_side = int(front_ratio * side_h)
+        # For hips, use side hip landmark directly if available
+        if side_hip_y is not None:
+            hip_row_side = int(side_hip_y)
+        else:
+            hip_row_side = int((hip_row_front / img_h) * side_h)
         hip_side_d = width_at_row(side_sil, hip_row_side, side_px_to_cm)
 
         if hip_side_d <= 0:
@@ -360,8 +425,11 @@ def estimate_from_landmarks(
         neck_row_front = int((nose_y + mid_shoulder_y) / 2)
         neck_front_w = width_at_row(front_sil, neck_row_front, px_to_cm)
 
-        front_ratio = neck_row_front / img_h
-        neck_row_side = int(front_ratio * side_h)
+        # Use side nose/shoulder landmarks for neck row if available
+        if side_nose_y is not None and side_shoulder_y is not None:
+            neck_row_side = int((side_nose_y + side_shoulder_y) / 2)
+        else:
+            neck_row_side = int((neck_row_front / img_h) * side_h)
         neck_side_d = width_at_row(side_sil, neck_row_side, side_px_to_cm)
 
         if neck_side_d <= 0:

@@ -37,6 +37,27 @@ STRETCH_FACTORS: dict[str, float] = {
     "wool": 0.02,
 }
 
+# Fabric drape coefficients (0 = stiff/structured, 1 = very drapey)
+# Affects how much the garment hugs the body vs holds its shape
+DRAPE_COEFFICIENTS: dict[str, float] = {
+    "silk": 0.90,
+    "rayon": 0.85,
+    "viscose": 0.80,
+    "modal": 0.78,
+    "tencel": 0.75,
+    "jersey": 0.70,
+    "cotton": 0.45,
+    "linen": 0.40,
+    "polyester": 0.35,
+    "nylon": 0.40,
+    "wool": 0.50,
+    "denim": 0.15,
+    "canvas": 0.10,
+    "elastane": 0.65,
+    "spandex": 0.65,
+    "lycra": 0.65,
+}
+
 
 def calculate_stretch_allowance(materials: dict[str, float]) -> float:
     """
@@ -51,16 +72,53 @@ def calculate_stretch_allowance(materials: dict[str, float]) -> float:
     return total_stretch
 
 
+def calculate_drape_coefficient(materials: dict[str, float]) -> float:
+    """
+    Calculate fabric drape coefficient from material composition.
+    Returns 0-1 where 0 = stiff/structured, 1 = very drapey.
+    """
+    total_drape = 0.0
+    for material, proportion in materials.items():
+        material_lower = material.lower()
+        drape = DRAPE_COEFFICIENTS.get(material_lower, 0.40)
+        total_drape += drape * proportion
+    return min(1.0, total_drape)
+
+
+def apparent_garment_dimension(
+    garment_cm: float,
+    body_cm: float,
+    drape: float,
+) -> float:
+    """
+    Predict the apparent (worn) garment dimension accounting for fabric drape.
+
+    A drapey fabric collapses toward the body, so the effective garment
+    measurement is closer to the body measurement. A stiff fabric holds
+    its flat/pattern shape.
+
+    Returns the effective garment dimension in cm.
+    """
+    excess = garment_cm - body_cm
+    if excess <= 0:
+        # Garment smaller than body — drape doesn't help, it's just tight
+        return garment_cm
+    # Drapey fabrics lose more of the excess to gravity
+    apparent_excess = excess * (1.0 - drape * 0.6)
+    return body_cm + apparent_excess
+
+
 def score_size(
     body: BodyMeasurements,
     garment_size: GarmentSize,
     fit_type: FitType,
     stretch: float,
+    drape: float = 0.0,
 ) -> tuple[float, list[str]]:
     """
     Score how well a garment size fits the user.
     Returns (score 0-1, list of fit notes).
-    Higher score = better fit.
+    Higher score = better fit. Accounts for fabric drape.
     """
     targets = EASE_TARGETS[fit_type]
     notes = []
@@ -68,7 +126,8 @@ def score_size(
 
     # --- Chest ---
     effective_chest = garment_size.chest_cm * (1 + stretch)
-    chest_ease = effective_chest - body.chest
+    apparent_chest = apparent_garment_dimension(effective_chest, body.chest, drape)
+    chest_ease = apparent_chest - body.chest
     target_chest_ease = targets["chest"]
     chest_diff = abs(chest_ease - target_chest_ease)
 
@@ -88,7 +147,8 @@ def score_size(
     # --- Waist ---
     if garment_size.waist_cm and body.waist:
         effective_waist = garment_size.waist_cm * (1 + stretch)
-        waist_ease = effective_waist - body.waist
+        apparent_waist = apparent_garment_dimension(effective_waist, body.waist, drape)
+        waist_ease = apparent_waist - body.waist
         target_waist_ease = targets["waist"]
         waist_diff = abs(waist_ease - target_waist_ease)
 
@@ -158,12 +218,13 @@ def recommend_size(
     and the garment's properties.
     """
     stretch = calculate_stretch_allowance(garment.material_composition)
+    drape = calculate_drape_coefficient(garment.material_composition)
 
     size_scores: dict[str, float] = {}
     size_notes: dict[str, list[str]] = {}
 
     for gs in garment.sizes:
-        score, notes = score_size(body, gs, garment.fit_type, stretch)
+        score, notes = score_size(body, gs, garment.fit_type, stretch, drape)
         size_scores[gs.size_label] = score
         size_notes[gs.size_label] = notes
 
